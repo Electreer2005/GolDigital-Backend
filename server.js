@@ -153,7 +153,29 @@ function normalizeMatch(m) {
         goals: {
             home: m.score && m.score.fullTime ? m.score.fullTime.home : null,
             away: m.score && m.score.fullTime ? m.score.fullTime.away : null
-        }
+        },
+        id: m.id
+    };
+}
+
+// Versión extendida para el detalle de un partido puntual: agrega todo lo
+// "extra" que venga en la respuesta (árbitro, estadio, instancia del torneo),
+// para poder ver de un vistazo qué te da realmente tu plan.
+function normalizeMatchDetail(m) {
+    const base = normalizeMatch(m);
+    return {
+        ...base,
+        matchday: m.matchday ?? null,
+        stage: m.stage ?? null,
+        group: m.group ?? null,
+        venue: m.venue ?? null,
+        referees: Array.isArray(m.referees) ? m.referees.map(r => r.name) : [],
+        halfTime: m.score && m.score.halfTime ? m.score.halfTime : null,
+        // Estos dos campos solo existen si tu plan incluye estadísticas/alineaciones —
+        // si vienen undefined, es la confirmación de que el plan free no los da.
+        homeLineup: m.homeTeam ? m.homeTeam.lineup ?? undefined : undefined,
+        awayLineup: m.awayTeam ? m.awayTeam.lineup ?? undefined : undefined,
+        statistics: m.statistics ?? undefined
     };
 }
 
@@ -255,7 +277,25 @@ app.get("/api/upcoming", async (req, res) => {
     }
 });
 
-// 5. Status
+// 5.1 Detalle de un partido puntual — para ver qué trae realmente tu plan
+// (estadísticas, alineaciones, árbitro, etc). Probalo con un id que veas en
+// la respuesta de /api/live, /api/results o /api/upcoming (campo "id").
+app.get("/api/match/:id", async (req, res) => {
+    try {
+        const { data, fromCache } = await fetchFootballData(`/matches/${req.params.id}`, 30 * 1000);
+        res.json({
+            ok: true,
+            cached: fromCache,
+            normalized: normalizeMatchDetail(data),
+            raw: data // dejamos el JSON crudo completo para poder ver TODO lo que manda la API
+        });
+    } catch (err) {
+        console.error(err.message);
+        res.status(err.status || 500).json({ ok: false, error: err.message });
+    }
+});
+
+// 5.2 Status
 app.get("/api/status", async (req, res) => {
     try {
         const r = await fetch(`${API_BASE}/competitions/PL`, { headers: { "X-Auth-Token": API_TOKEN } });
