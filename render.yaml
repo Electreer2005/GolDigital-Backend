@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: goldigital-backend
+    runtime: node
+    plan: free
+    rootDir: backend
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: FRONTEND_ORIGIN
+        value: https://gol-digital.vercel.app
+      - key: SITE_TIMEZONE
+        value: America/Argentina/Buenos_Aires
+      - key: FOOTBALL_DATA_TOKEN
+        sync: false
