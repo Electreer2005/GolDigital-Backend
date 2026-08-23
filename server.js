@@ -2,6 +2,12 @@
 require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
+const helmet = require("helmet");
+const rateLimit = require("express-rate-limit");
+const morgan = require("morgan");
+
+const NODE_ENV = process.env.NODE_ENV || "development";
+const IS_PROD = NODE_ENV === "production";
 
 const API_BASE = "https://api.football-data.org/v4";
 const API_TOKEN = process.env.FOOTBALL_DATA_TOKEN;
@@ -11,7 +17,18 @@ if (!API_TOKEN) {
 }
 
 const PORT = process.env.PORT || 3000;
-const ALLOWED_ORIGIN = process.env.FRONTEND_ORIGIN || "*";
+
+// FRONTEND_ORIGIN admite uno o varios orígenes separados por coma, ej:
+// "https://gol-digital.vercel.app,https://www.goldigital.com"
+// En desarrollo, si no está seteado, se permite cualquier origen para no trabar el testeo local.
+const ALLOWED_ORIGINS = (process.env.FRONTEND_ORIGIN || "")
+    .split(",")
+    .map(o => o.trim())
+    .filter(Boolean);
+
+if (IS_PROD && ALLOWED_ORIGINS.length === 0) {
+    console.warn("⚠️  FRONTEND_ORIGIN no está seteado en producción — el backend va a rechazar todos los orígenes por CORS hasta que lo configures en Render.");
+}
 
 // ======= LIGAS DISPONIBLES EN EL PLAN FREE =======
 // (Actualizado con los IDs correctos de football-data.org)
@@ -29,7 +46,40 @@ const FREE_COMPETITIONS = {
 };
 
 const app = express();
-app.use(cors({ origin: ALLOWED_ORIGIN }));
+
+// Render está detrás de un proxy — hace falta para que express-rate-limit
+// identifique bien la IP real del visitante en vez de la del proxy.
+app.set("trust proxy", 1);
+
+app.use(helmet());
+app.use(morgan(IS_PROD ? "combined" : "dev"));
+
+app.use(cors({
+    origin(origin, callback) {
+        // Pedidos sin header Origin (curl, health checks del propio Render) siempre pasan.
+        if (!origin) return callback(null, true);
+        // En desarrollo sin FRONTEND_ORIGIN seteado, permitimos todo para no trabar el testeo local.
+        if (!IS_PROD && ALLOWED_ORIGINS.length === 0) return callback(null, true);
+        if (ALLOWED_ORIGINS.includes(origin)) return callback(null, true);
+        callback(new Error(`Origen no permitido por CORS: ${origin}`));
+    }
+}));
+
+// Protege la cuota diaria/por-minuto de football-data.org: como el backend es
+// público, sin esto cualquiera podría bombardearlo de pedidos y agotar tu cupo.
+const apiLimiter = rateLimit({
+    windowMs: 60 * 1000,
+    limit: 30, // 30 pedidos por minuto por IP — de sobra para uso normal del sitio
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { ok: false, error: "Demasiados pedidos, esperá un minuto e intentá de nuevo." }
+});
+app.use("/api/", apiLimiter);
+
+// Sanity check al entrar directo a la URL del backend en el navegador.
+app.get("/", (req, res) => {
+    res.json({ ok: true, service: "goldigital-backend", env: NODE_ENV });
+});
 
 // ======= CACHE EN MEMORIA =======
 const cache = new Map();
@@ -216,6 +266,23 @@ app.get("/api/status", async (req, res) => {
     }
 });
 
+// Handler final: si algo tira error (ej. CORS rechazado) devolvemos JSON prolijo,
+// no un stack trace HTML de Express.
+app.use((err, req, res, next) => {
+    console.error(err.message);
+    res.status(err.status || 500).json({ ok: false, error: err.message || "Error interno" });
+});
+
+process.on("unhandledRejection", (reason) => {
+    console.error("Unhandled rejection:", reason);
+});
+process.on("uncaughtException", (err) => {
+    console.error("Uncaught exception:", err);
+    // Dejamos que Render reinicie el proceso en vez de seguir en un estado inconsistente.
+    process.exit(1);
+});
+
 app.listen(PORT, () => {
-    console.log(`GolDigital backend (football-data.org) en puerto ${PORT}`);
+    console.log(`GolDigital backend (football-data.org) en puerto ${PORT} — entorno: ${NODE_ENV}`);
+    if (ALLOWED_ORIGINS.length) console.log(`CORS habilitado para: ${ALLOWED_ORIGINS.join(", ")}`);
 });
