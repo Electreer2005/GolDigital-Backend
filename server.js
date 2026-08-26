@@ -310,6 +310,45 @@ app.get("/api/standings", async (req, res) => {
     }
 });
 
+// 4.2 Equipos de una liga — para armar el selector de "equipo favorito".
+// Cache larga: la lista de equipos de una competición casi no cambia en la temporada.
+app.get("/api/teams", async (req, res) => {
+    try {
+        const compId = getCompetitionId(req);
+        const { data, fromCache } = await fetchFootballData(`/competitions/${compId}/teams`, 60 * 60 * 1000);
+        const teams = (data.teams || []).map(t => ({ id: t.id, name: t.name, crest: t.crest }));
+        res.json({ ok: true, cached: fromCache, response: teams });
+    } catch (err) {
+        console.error(err.message);
+        res.status(err.status || 500).json({ ok: false, error: err.message });
+    }
+});
+
+// 4.3 Resumen de un equipo puntual: en vivo ahora / último resultado / próximo partido.
+// Usa /teams/:id/matches, que trae los partidos del equipo en TODAS las competiciones
+// en las que juega (liga local + copas internacionales), no solo una.
+app.get("/api/team/:id/overview", async (req, res) => {
+    const teamId = req.params.id;
+    try {
+        const [liveRes, lastRes, nextRes] = await Promise.all([
+            fetchFootballData(`/teams/${teamId}/matches?status=LIVE`, 60 * 1000),
+            fetchFootballData(`/teams/${teamId}/matches?status=FINISHED&dateFrom=${isoDaysAgo(45)}&dateTo=${todayISO()}`, 10 * 60 * 1000),
+            fetchFootballData(`/teams/${teamId}/matches?status=SCHEDULED&dateFrom=${todayISO()}&dateTo=${isoInDays(45)}`, 10 * 60 * 1000)
+        ]);
+        const live = (liveRes.data.matches || []).map(normalizeMatch);
+        const finished = lastRes.data.matches || [];
+        const scheduled = nextRes.data.matches || [];
+        // La API devuelve los partidos ordenados por fecha ascendente: el último
+        // jugado es el final del array de finalizados, el próximo es el primero de los programados.
+        const last = finished.length ? normalizeMatch(finished[finished.length - 1]) : null;
+        const next = scheduled.length ? normalizeMatch(scheduled[0]) : null;
+        res.json({ ok: true, response: { live, last, next } });
+    } catch (err) {
+        console.error(err.message);
+        res.status(err.status || 500).json({ ok: false, error: err.message });
+    }
+});
+
 // 5.1 Detalle de un partido puntual — para ver qué trae realmente tu plan
 // (estadísticas, alineaciones, árbitro, etc). Probalo con un id que veas en
 // la respuesta de /api/live, /api/results o /api/upcoming (campo "id").
