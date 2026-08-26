@@ -42,7 +42,11 @@ const FREE_COMPETITIONS = {
     "ELC": { id: 2016, name: "Championship (ING)" },
     "PPL": { id: 2017, name: "Primeira Liga" },
     "DED": { id: 2003, name: "Eredivisie" },
-    // Podés agregar más si el plan free las cubre (ej. Liga MX no está)
+    "BSA": { id: 2013, name: "Brasileirão Série A" },
+    "WC":  { id: 2000, name: "Mundial" },
+    "EC":  { id: 2018, name: "Eurocopa" }
+    // Estas 12 son las que confirma el plan free en football-data.org/pricing.
+    // Si en algún momento cambia tu plan, agregá/sacá acá.
 };
 
 const app = express();
@@ -271,6 +275,35 @@ app.get("/api/upcoming", async (req, res) => {
         );
         const matches = (data.matches || []).slice(0, 6).map(normalizeMatch);
         res.json({ ok: true, cached: fromCache, response: matches });
+    } catch (err) {
+        console.error(err.message);
+        res.status(err.status || 500).json({ ok: false, error: err.message });
+    }
+});
+
+// 4.1 Tabla de posiciones. Cache: 15 min (cambia poco de un día a otro).
+app.get("/api/standings", async (req, res) => {
+    try {
+        const compId = getCompetitionId(req);
+        const { data, fromCache } = await fetchFootballData(`/competitions/${compId}/standings`, 15 * 60 * 1000);
+        // "TOTAL" es la tabla general. Competiciones por grupos (Mundial, Champions,
+        // Eurocopa) devuelven varias tablas (una por grupo) en vez de una sola general.
+        const groups = (data.standings || []).filter(s => s.type === "TOTAL");
+        const mapRow = row => ({
+            position: row.position,
+            team: { name: row.team.name, crest: row.team.crest },
+            played: row.playedGames,
+            won: row.won,
+            draw: row.draw,
+            lost: row.lost,
+            goalDifference: row.goalDifference,
+            points: row.points
+        });
+        const table = groups.length === 1 ? groups[0].table.map(mapRow) : null;
+        const byGroup = groups.length > 1
+            ? groups.map(g => ({ group: g.group, table: g.table.map(mapRow) }))
+            : null;
+        res.json({ ok: true, cached: fromCache, response: table, byGroup });
     } catch (err) {
         console.error(err.message);
         res.status(err.status || 500).json({ ok: false, error: err.message });
