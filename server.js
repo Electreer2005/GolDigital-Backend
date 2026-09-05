@@ -419,6 +419,30 @@ app.post("/api/push/subscribe", express.json(), async (req, res) => {
     res.json({ ok: true });
 });
 
+// Manda una notificación de prueba DIRECTO a una suscripción puntual, sin tocar
+// Supabase ni depender de ningún partido real — para confirmar rápido que todo
+// el circuito (VAPID + service worker + navegador) funciona de punta a punta.
+app.post("/api/push/test", express.json(), async (req, res) => {
+    const { subscription } = req.body || {};
+    if (!subscription || !subscription.endpoint || !subscription.keys) {
+        return res.status(400).json({ ok: false, error: "Falta subscription" });
+    }
+    try {
+        await webpush.sendNotification(
+            subscription,
+            JSON.stringify({
+                title: "GolDigital",
+                body: "Notificación de prueba — si ves esto, ¡el circuito funciona! 🎉",
+                url: "/"
+            })
+        );
+        res.json({ ok: true });
+    } catch (err) {
+        console.error("Error en push de prueba:", err.message);
+        res.status(err.statusCode || 500).json({ ok: false, error: err.message });
+    }
+});
+
 app.post("/api/push/unsubscribe", express.json(), async (req, res) => {
     if (!supabaseAdmin) return res.status(500).json({ ok: false, error: "Supabase no configurado en el backend" });
     const { endpoint } = req.body || {};
