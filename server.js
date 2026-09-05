@@ -5,6 +5,8 @@ const cors = require("cors");
 const helmet = require("helmet");
 const rateLimit = require("express-rate-limit");
 const morgan = require("morgan");
+const webpush = require("web-push");
+const { createClient } = require("@supabase/supabase-js");
 
 const NODE_ENV = process.env.NODE_ENV || "development";
 const IS_PROD = NODE_ENV === "production";
@@ -28,6 +30,29 @@ const ALLOWED_ORIGINS = (process.env.FRONTEND_ORIGIN || "")
 
 if (IS_PROD && ALLOWED_ORIGINS.length === 0) {
     console.warn("⚠️  FRONTEND_ORIGIN no está seteado en producción — el backend va a rechazar todos los orígenes por CORS hasta que lo configures en Render.");
+}
+
+// ======= NOTIFICACIONES PUSH =======
+const VAPID_PUBLIC_KEY = process.env.VAPID_PUBLIC_KEY;
+const VAPID_PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY;
+const VAPID_SUBJECT = process.env.VAPID_SUBJECT || "mailto:soporte@goldigital.app";
+const CRON_SECRET = process.env.CRON_SECRET;
+
+if (VAPID_PUBLIC_KEY && VAPID_PRIVATE_KEY) {
+    webpush.setVapidDetails(VAPID_SUBJECT, VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY);
+} else {
+    console.warn("⚠️  Faltan VAPID_PUBLIC_KEY / VAPID_PRIVATE_KEY — las notificaciones push no van a funcionar hasta que las configures.");
+}
+
+// Cliente de Supabase con la service role key: SOLO se usa acá en el backend,
+// nunca en el frontend — bypassea RLS a propósito para guardar/leer suscripciones.
+const supabaseAdmin =
+    process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY
+        ? createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY)
+        : null;
+
+if (!supabaseAdmin) {
+    console.warn("⚠️  Faltan SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY — las suscripciones push no se van a poder guardar.");
 }
 
 // ======= LIGAS DISPONIBLES EN EL PLAN FREE =======
@@ -368,6 +393,133 @@ app.get("/api/match/:id", async (req, res) => {
 });
 
 // 5.2 Status
+// ======= RUTAS DE NOTIFICACIONES PUSH =======
+
+// El frontend pide la clave pública para poder suscribirse (evita hardcodearla ahí también)
+app.get("/api/push/public-key", (req, res) => {
+    if (!VAPID_PUBLIC_KEY) return res.status(500).json({ ok: false, error: "VAPID_PUBLIC_KEY no configurada" });
+    res.json({ ok: true, key: VAPID_PUBLIC_KEY });
+});
+
+// Guarda (o actualiza, si ya existe ese endpoint) la suscripción del navegador,
+// asociada al equipo que el usuario eligió como favorito.
+app.post("/api/push/subscribe", express.json(), async (req, res) => {
+    if (!supabaseAdmin) return res.status(500).json({ ok: false, error: "Supabase no configurado en el backend" });
+    const { subscription, teamId } = req.body || {};
+    if (!subscription || !subscription.endpoint || !subscription.keys || !teamId) {
+        return res.status(400).json({ ok: false, error: "Falta subscription o teamId" });
+    }
+    const { error } = await supabaseAdmin.from("push_subscriptions").upsert({
+        endpoint: subscription.endpoint,
+        team_id: String(teamId),
+        p256dh: subscription.keys.p256dh,
+        auth: subscription.keys.auth
+    });
+    if (error) return res.status(500).json({ ok: false, error: error.message });
+    res.json({ ok: true });
+});
+
+app.post("/api/push/unsubscribe", express.json(), async (req, res) => {
+    if (!supabaseAdmin) return res.status(500).json({ ok: false, error: "Supabase no configurado en el backend" });
+    const { endpoint } = req.body || {};
+    if (!endpoint) return res.status(400).json({ ok: false, error: "Falta endpoint" });
+    await supabaseAdmin.from("push_subscriptions").delete().eq("endpoint", endpoint);
+    res.json({ ok: true });
+});
+
+async function alreadyNotified(matchId, kind) {
+    const { data } = await supabaseAdmin
+        .from("push_notifications_sent")
+        .select("match_id")
+        .eq("match_id", String(matchId))
+        .eq("kind", kind)
+        .maybeSingle();
+    return !!data;
+}
+
+async function markNotified(matchId, kind) {
+    await supabaseAdmin.from("push_notifications_sent").insert({ match_id: String(matchId), kind });
+}
+
+async function notifySubscribers(subs, payload) {
+    await Promise.all(
+        subs.map(async (s) => {
+            const pushSub = { endpoint: s.endpoint, keys: { p256dh: s.p256dh, auth: s.auth } };
+            try {
+                await webpush.sendNotification(pushSub, JSON.stringify(payload));
+            } catch (err) {
+                // 404/410 = el navegador invalidó esa suscripción (desinstaló, borró datos, etc.) — la limpiamos.
+                if (err.statusCode === 404 || err.statusCode === 410) {
+                    await supabaseAdmin.from("push_subscriptions").delete().eq("endpoint", s.endpoint);
+                } else {
+                    console.error("Error enviando push:", err.message);
+                }
+            }
+        })
+    );
+}
+
+// Disparador periódico — lo llama un cron externo (cron-job.org, GitHub Actions, etc.)
+// cada 1-2 minutos, protegido por CRON_SECRET para que nadie más lo dispare.
+app.get("/api/push/check", async (req, res) => {
+    if (!CRON_SECRET || req.query.key !== CRON_SECRET) {
+        return res.status(401).json({ ok: false, error: "unauthorized" });
+    }
+    if (!supabaseAdmin) return res.status(500).json({ ok: false, error: "Supabase no configurado en el backend" });
+
+    try {
+        const { data: subs, error } = await supabaseAdmin.from("push_subscriptions").select("*");
+        if (error) throw error;
+
+        const teamIds = [...new Set((subs || []).map((s) => s.team_id))];
+        let notificationsSent = 0;
+        const today = todayISO();
+
+        for (const teamId of teamIds) {
+            const teamSubs = subs.filter((s) => s.team_id === teamId);
+
+            const [liveRes, todayRes] = await Promise.all([
+                fetchFootballData(`/teams/${teamId}/matches?status=LIVE`, 30 * 1000),
+                fetchFootballData(`/teams/${teamId}/matches?status=SCHEDULED&dateFrom=${today}&dateTo=${today}`, 30 * 1000)
+            ]);
+
+            // 1) Arranca en los próximos 10 minutos
+            for (const m of todayRes.data.matches || []) {
+                const minsUntil = (new Date(m.utcDate).getTime() - Date.now()) / 60000;
+                if (minsUntil > 0 && minsUntil <= 10 && !(await alreadyNotified(m.id, "starting"))) {
+                    await notifySubscribers(teamSubs, {
+                        title: "GolDigital",
+                        body: `${m.homeTeam.name} vs ${m.awayTeam.name} arranca en breve`,
+                        url: "/"
+                    });
+                    await markNotified(m.id, "starting");
+                    notificationsSent++;
+                }
+            }
+
+            // 2) Ya está en vivo
+            for (const m of liveRes.data.matches || []) {
+                if (!(await alreadyNotified(m.id, "live"))) {
+                    const home = m.score?.fullTime?.home ?? 0;
+                    const away = m.score?.fullTime?.away ?? 0;
+                    await notifySubscribers(teamSubs, {
+                        title: "¡Arrancó!",
+                        body: `${m.homeTeam.name} ${home} - ${away} ${m.awayTeam.name}`,
+                        url: "/"
+                    });
+                    await markNotified(m.id, "live");
+                    notificationsSent++;
+                }
+            }
+        }
+
+        res.json({ ok: true, teamsChecked: teamIds.length, notificationsSent });
+    } catch (err) {
+        console.error(err.message);
+        res.status(500).json({ ok: false, error: err.message });
+    }
+});
+
 app.get("/api/status", async (req, res) => {
     try {
         const r = await fetch(`${API_BASE}/competitions/PL`, { headers: { "X-Auth-Token": API_TOKEN } });
