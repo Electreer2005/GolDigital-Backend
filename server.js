@@ -122,14 +122,77 @@ app.get("/api/team/:id/overview", async (req, res) => {
 app.get("/api/match/:id", async (req, res) => { try { const { data, fromCache } = await fetchFootballData(`/matches/${req.params.id}`, 30000); res.json({ ok: true, cached: fromCache, normalized: normalizeMatchDetail(data), raw: data }); } catch (err) { console.error(err.message); res.status(err.status || 500).json({ ok: false, error: err.message }); } });
 
 app.get("/api/push/public-key", (req, res) => { if (!VAPID_PUBLIC_KEY) return res.status(500).json({ ok: false, error: "VAPID_PUBLIC_KEY no configurada" }); res.json({ ok: true, key: VAPID_PUBLIC_KEY }); });
-app.post("/api/push/subscribe", express.json(), async (req, res) => { if (!supabaseAdmin) return res.status(500).json({ ok: false, error: "Supabase no configurado en el backend" }); const { subscription, teamId } = req.body || {}; if (!subscription?.endpoint || !subscription.keys || !teamId) return res.status(400).json({ ok: false, error: "Falta subscription o teamId" }); const { error } = await supabaseAdmin.from("push_subscriptions").upsert({ endpoint: subscription.endpoint, team_id: String(teamId), p256dh: subscription.keys.p256dh, auth: subscription.keys.auth }); if (error) return res.status(500).json({ ok: false, error: error.message }); res.json({ ok: true }); });
+app.post("/api/push/subscribe", express.json(), async (req, res) => {
+    if (!supabaseAdmin) return res.status(500).json({ ok: false, error: "Supabase no configurado en el backend" });
+    const { subscription, teamId, teamIds } = req.body || {};
+    const ids = [...new Set((Array.isArray(teamIds) ? teamIds : [teamId]).filter(Boolean).map(String))];
+    if (!subscription?.endpoint || !subscription.keys || ids.length === 0) return res.status(400).json({ ok: false, error: "Falta subscription o equipos" });
+    await supabaseAdmin.from("push_subscriptions").delete().eq("endpoint", subscription.endpoint);
+    const rows = ids.map(id => ({ endpoint: subscription.endpoint, team_id: id, p256dh: subscription.keys.p256dh, auth: subscription.keys.auth }));
+    const { error } = await supabaseAdmin.from("push_subscriptions").insert(rows);
+    if (error) return res.status(500).json({ ok: false, error: error.message });
+    res.json({ ok: true, teams: ids.length });
+});
 app.post("/api/push/test", express.json(), async (req, res) => { const { subscription } = req.body || {}; if (!subscription?.endpoint || !subscription.keys) return res.status(400).json({ ok: false, error: "Falta subscription" }); try { await webpush.sendNotification(subscription, JSON.stringify({ title: "GolDigital", body: "Notificación de prueba — si ves esto, ¡el circuito funciona! 🎉", url: "/" })); res.json({ ok: true }); } catch (err) { console.error("Error en push de prueba:", err.message); res.status(err.statusCode || 500).json({ ok: false, error: err.message }); } });
 app.post("/api/push/unsubscribe", express.json(), async (req, res) => { if (!supabaseAdmin) return res.status(500).json({ ok: false, error: "Supabase no configurado en el backend" }); const { endpoint } = req.body || {}; if (!endpoint) return res.status(400).json({ ok: false, error: "Falta endpoint" }); await supabaseAdmin.from("push_subscriptions").delete().eq("endpoint", endpoint); res.json({ ok: true }); });
 
 async function alreadyNotified(matchId, kind) { const { data } = await supabaseAdmin.from("push_notifications_sent").select("match_id").eq("match_id", String(matchId)).eq("kind", kind).maybeSingle(); return !!data; }
 async function markNotified(matchId, kind) { await supabaseAdmin.from("push_notifications_sent").insert({ match_id: String(matchId), kind }); }
 async function notifySubscribers(subs, payload) { await Promise.all(subs.map(async s => { const pushSub = { endpoint: s.endpoint, keys: { p256dh: s.p256dh, auth: s.auth } }; try { await webpush.sendNotification(pushSub, JSON.stringify(payload)); } catch (err) { if (err.statusCode === 404 || err.statusCode === 410) await supabaseAdmin.from("push_subscriptions").delete().eq("endpoint", s.endpoint); else console.error("Error enviando push:", err.message); } })); }
-app.get("/api/push/check", async (req, res) => { if (!CRON_SECRET || req.query.key !== CRON_SECRET) return res.status(401).json({ ok: false, error: "unauthorized" }); if (!supabaseAdmin) return res.status(500).json({ ok: false, error: "Supabase no configurado en el backend" }); try { const { data: subs, error } = await supabaseAdmin.from("push_subscriptions").select("*"); if (error) throw error; const teamIds = [...new Set((subs || []).map(s => s.team_id))]; let notificationsSent = 0; const today = todayISO(); for (const teamId of teamIds) { const teamSubs = subs.filter(s => s.team_id === teamId); const [liveRes, todayRes] = await Promise.all([fetchFootballData(`/teams/${teamId}/matches?status=LIVE`, 30000), fetchFootballData(`/teams/${teamId}/matches?status=SCHEDULED&dateFrom=${today}&dateTo=${today}`, 30000)]); for (const m of todayRes.data.matches || []) { const minsUntil = (new Date(m.utcDate).getTime() - Date.now()) / 60000; if (minsUntil > 0 && minsUntil <= 10 && !(await alreadyNotified(m.id, "starting"))) { await notifySubscribers(teamSubs, { title: "GolDigital", body: `${m.homeTeam.name} vs ${m.awayTeam.name} arranca en breve`, url: "/" }); await markNotified(m.id, "starting"); notificationsSent++; } } for (const m of liveRes.data.matches || []) { if (!(await alreadyNotified(m.id, "live"))) { const home = m.score?.fullTime?.home ?? 0; const away = m.score?.fullTime?.away ?? 0; await notifySubscribers(teamSubs, { title: "¡Arrancó!", body: `${m.homeTeam.name} ${home} - ${away} ${m.awayTeam.name}`, url: "/" }); await markNotified(m.id, "live"); notificationsSent++; } } } res.json({ ok: true, teamsChecked: teamIds.length, notificationsSent }); } catch (err) { console.error(err.message); res.status(500).json({ ok: false, error: err.message }); } });
+app.get("/api/push/check", async (req, res) => {
+    if (!CRON_SECRET || req.query.key !== CRON_SECRET) return res.status(401).json({ ok: false, error: "unauthorized" });
+    if (!supabaseAdmin) return res.status(500).json({ ok: false, error: "Supabase no configurado en el backend" });
+    try {
+        const { data: subs, error } = await supabaseAdmin.from("push_subscriptions").select("*");
+        if (error) throw error;
+        const teamIds = [...new Set((subs || []).map(s => s.team_id))];
+        let notificationsSent = 0;
+        const today = todayISO();
+
+        for (const teamId of teamIds) {
+            const teamSubs = subs.filter(s => String(s.team_id) === String(teamId));
+            const [liveRes, todayRes, finishedRes] = await Promise.all([
+                fetchFootballData(`/teams/${teamId}/matches?status=LIVE`, 30000),
+                fetchFootballData(`/teams/${teamId}/matches?status=SCHEDULED&dateFrom=${today}&dateTo=${today}`, 30000),
+                fetchFootballData(`/teams/${teamId}/matches?status=FINISHED&dateFrom=${today}&dateTo=${today}`, 30000)
+            ]);
+
+            for (const m of todayRes.data.matches || []) {
+                const minsUntil = (new Date(m.utcDate).getTime() - Date.now()) / 60000;
+                if (minsUntil > 0 && minsUntil <= 10 && !(await alreadyNotified(m.id, "starting"))) {
+                    await notifySubscribers(teamSubs, { title: "⚽ Partido en breve", body: `${m.homeTeam.name} vs ${m.awayTeam.name} arranca en menos de 10 minutos`, url: `/team/${teamId}`, tag: `match-${m.id}-starting` });
+                    await markNotified(m.id, "starting"); notificationsSent++;
+                }
+            }
+
+            for (const m of liveRes.data.matches || []) {
+                if (!(await alreadyNotified(m.id, "live"))) {
+                    await notifySubscribers(teamSubs, { title: "🔴 ¡Arrancó!", body: `${m.homeTeam.name} vs ${m.awayTeam.name} ya está en juego`, url: `/team/${teamId}`, tag: `match-${m.id}-live` });
+                    await markNotified(m.id, "live"); notificationsSent++;
+                }
+                const home = m.score?.fullTime?.home ?? m.score?.halfTime?.home;
+                const away = m.score?.fullTime?.away ?? m.score?.halfTime?.away;
+                if (home != null && away != null) {
+                    const scoreKind = `score-${home}-${away}`;
+                    if (!(await alreadyNotified(m.id, scoreKind))) {
+                        await notifySubscribers(teamSubs, { title: "⚽ Cambio en el marcador", body: `${m.homeTeam.name} ${home} - ${away} ${m.awayTeam.name}`, url: `/team/${teamId}`, tag: `match-${m.id}-score` });
+                        await markNotified(m.id, scoreKind); notificationsSent++;
+                    }
+                }
+            }
+
+            for (const m of finishedRes.data.matches || []) {
+                if (!(await alreadyNotified(m.id, "finished"))) {
+                    const home = m.score?.fullTime?.home ?? 0;
+                    const away = m.score?.fullTime?.away ?? 0;
+                    await notifySubscribers(teamSubs, { title: "🏁 Final del partido", body: `${m.homeTeam.name} ${home} - ${away} ${m.awayTeam.name}`, url: `/team/${teamId}`, tag: `match-${m.id}-finished` });
+                    await markNotified(m.id, "finished"); notificationsSent++;
+                }
+            }
+        }
+        res.json({ ok: true, teamsChecked: teamIds.length, notificationsSent });
+    } catch (err) { console.error(err.message); res.status(500).json({ ok: false, error: err.message }); }
+});
 app.get("/api/status", async (req, res) => { try { const r = await fetch(`${API_BASE}/competitions/PL`, { headers: { "X-Auth-Token": API_TOKEN } }); const json = await r.json(); res.json({ ok: r.ok, backend: "up", footballData: r.ok ? { name: json.name } : json }); } catch (err) { res.status(500).json({ ok: false, error: err.message }); } });
 app.use((err, req, res, next) => { console.error(err.message); res.status(err.status || 500).json({ ok: false, error: err.message || "Error interno" }); });
 process.on("unhandledRejection", reason => console.error("Unhandled rejection:", reason));
