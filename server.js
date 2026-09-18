@@ -99,10 +99,13 @@ app.get("/api/results", async (req, res) => { try { const compId = getCompetitio
 app.get("/api/upcoming", async (req, res) => { try { const compId = getCompetitionId(req); const { data, fromCache } = await fetchFootballData(`/matches?competitions=${compId}&dateFrom=${todayISO()}&dateTo=${isoInDays(10)}&status=SCHEDULED`, 600000); res.json({ ok: true, cached: fromCache, response: (data.matches || []).slice(0, 6).map(normalizeMatch) }); } catch (err) { console.error(err.message); res.status(err.status || 500).json({ ok: false, error: err.message }); } });
 app.get("/api/calendar", async (req, res) => {
     try {
-        const compId = getCompetitionId(req);
+        const league = String(req.query.league || "PL").toUpperCase();
         const date = String(req.query.date || todayISO());
         if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return res.status(400).json({ ok: false, error: "Fecha inválida. Usá YYYY-MM-DD." });
-        const { data, fromCache } = await fetchFootballData(`/matches?competitions=${compId}&dateFrom=${date}&dateTo=${date}`, 120000);
+        const path = league === "ALL"
+            ? `/matches?dateFrom=${date}&dateTo=${date}`
+            : `/matches?competitions=${getCompetitionId(req)}&dateFrom=${date}&dateTo=${date}`;
+        const { data, fromCache } = await fetchFootballData(path, 120000);
         res.json({ ok: true, cached: fromCache, date, response: (data.matches || []).map(normalizeMatch) });
     } catch (err) { console.error(err.message); res.status(err.status || 500).json({ ok: false, error: err.message }); }
 });
