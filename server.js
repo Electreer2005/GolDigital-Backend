@@ -145,52 +145,105 @@ app.get("/api/push/check", async (req, res) => {
     try {
         const { data: subs, error } = await supabaseAdmin.from("push_subscriptions").select("*");
         if (error) throw error;
-        const teamIds = [...new Set((subs || []).map(s => s.team_id))];
+        const teamIds = [...new Set((subs || []).map(s => String(s.team_id)))];
+        const followedTeams = new Set(teamIds);
         let notificationsSent = 0;
-        const today = todayISO();
 
-        for (const teamId of teamIds) {
-            const teamSubs = subs.filter(s => String(s.team_id) === String(teamId));
-            const [liveRes, todayRes, finishedRes] = await Promise.all([
-                fetchFootballData(`/teams/${teamId}/matches?status=LIVE`, 30000),
-                fetchFootballData(`/teams/${teamId}/matches?status=SCHEDULED&dateFrom=${today}&dateTo=${today}`, 30000),
-                fetchFootballData(`/teams/${teamId}/matches?status=FINISHED&dateFrom=${today}&dateTo=${today}`, 30000)
-            ]);
+        // Una sola consulta global por ejecución. Pedimos un margen de tres días UTC
+        // y luego filtramos por el día local del sitio para no perder partidos cerca de medianoche.
+        const matchesRes = await fetchFootballData(
+            `/matches?dateFrom=${isoDaysAgo(1)}&dateTo=${isoInDays(1)}`,
+            30000
+        );
+        const todayLocal = dateKeyInTZ(new Date(), SITE_TIMEZONE);
+        const matches = (matchesRes.data.matches || []).filter(m => {
+            const homeId = String(m.homeTeam?.id || "");
+            const awayId = String(m.awayTeam?.id || "");
+            return (followedTeams.has(homeId) || followedTeams.has(awayId))
+                && dateKeyInTZ(new Date(m.utcDate), SITE_TIMEZONE) === todayLocal;
+        });
 
-            for (const m of todayRes.data.matches || []) {
+        for (const m of matches) {
+            const homeId = String(m.homeTeam?.id || "");
+            const awayId = String(m.awayTeam?.id || "");
+            const relevantTeamIds = new Set([homeId, awayId].filter(id => followedTeams.has(id)));
+
+            // Unimos los suscriptores de ambos equipos y deduplicamos por endpoint.
+            // Así un partido se procesa una sola vez y nadie queda afuera por seguir al rival.
+            const matchSubs = [...new Map(
+                (subs || [])
+                    .filter(s => relevantTeamIds.has(String(s.team_id)))
+                    .map(s => [s.endpoint, s])
+            ).values()];
+            if (matchSubs.length === 0) continue;
+
+            const targetTeamId = relevantTeamIds.values().next().value;
+            const targetUrl = `/team/${targetTeamId}`;
+
+            if (m.status === "SCHEDULED" || m.status === "TIMED") {
                 const minsUntil = (new Date(m.utcDate).getTime() - Date.now()) / 60000;
                 if (minsUntil > 0 && minsUntil <= 10 && !(await alreadyNotified(m.id, "starting"))) {
-                    await notifySubscribers(teamSubs, { title: "⚽ Partido en breve", body: `${m.homeTeam.name} vs ${m.awayTeam.name} arranca en menos de 10 minutos`, url: `/team/${teamId}`, tag: `match-${m.id}-starting` });
-                    await markNotified(m.id, "starting"); notificationsSent++;
+                    await notifySubscribers(matchSubs, {
+                        title: "⚽ Partido en breve",
+                        body: `${m.homeTeam.name} vs ${m.awayTeam.name} arranca en menos de 10 minutos`,
+                        url: targetUrl,
+                        tag: `match-${m.id}-starting`
+                    });
+                    await markNotified(m.id, "starting");
+                    notificationsSent++;
                 }
             }
 
-            for (const m of liveRes.data.matches || []) {
+            if (m.status === "IN_PLAY" || m.status === "PAUSED") {
                 if (!(await alreadyNotified(m.id, "live"))) {
-                    await notifySubscribers(teamSubs, { title: "🔴 ¡Arrancó!", body: `${m.homeTeam.name} vs ${m.awayTeam.name} ya está en juego`, url: `/team/${teamId}`, tag: `match-${m.id}-live` });
-                    await markNotified(m.id, "live"); notificationsSent++;
+                    await notifySubscribers(matchSubs, {
+                        title: "🔴 ¡Arrancó!",
+                        body: `${m.homeTeam.name} vs ${m.awayTeam.name} ya está en juego`,
+                        url: targetUrl,
+                        tag: `match-${m.id}-live`
+                    });
+                    await markNotified(m.id, "live");
+                    notificationsSent++;
                 }
+
                 const home = m.score?.fullTime?.home ?? m.score?.halfTime?.home;
                 const away = m.score?.fullTime?.away ?? m.score?.halfTime?.away;
                 if (home != null && away != null) {
                     const scoreKind = `score-${home}-${away}`;
                     if (!(await alreadyNotified(m.id, scoreKind))) {
-                        await notifySubscribers(teamSubs, { title: "⚽ Cambio en el marcador", body: `${m.homeTeam.name} ${home} - ${away} ${m.awayTeam.name}`, url: `/team/${teamId}`, tag: `match-${m.id}-score` });
-                        await markNotified(m.id, scoreKind); notificationsSent++;
+                        await notifySubscribers(matchSubs, {
+                            title: "⚽ Cambio en el marcador",
+                            body: `${m.homeTeam.name} ${home} - ${away} ${m.awayTeam.name}`,
+                            url: targetUrl,
+                            tag: `match-${m.id}-score`
+                        });
+                        await markNotified(m.id, scoreKind);
+                        notificationsSent++;
                     }
                 }
             }
 
-            for (const m of finishedRes.data.matches || []) {
-                if (!(await alreadyNotified(m.id, "finished"))) {
-                    const home = m.score?.fullTime?.home ?? 0;
-                    const away = m.score?.fullTime?.away ?? 0;
-                    await notifySubscribers(teamSubs, { title: "🏁 Final del partido", body: `${m.homeTeam.name} ${home} - ${away} ${m.awayTeam.name}`, url: `/team/${teamId}`, tag: `match-${m.id}-finished` });
-                    await markNotified(m.id, "finished"); notificationsSent++;
-                }
+            if (m.status === "FINISHED" && !(await alreadyNotified(m.id, "finished"))) {
+                const home = m.score?.fullTime?.home ?? 0;
+                const away = m.score?.fullTime?.away ?? 0;
+                await notifySubscribers(matchSubs, {
+                    title: "🏁 Final del partido",
+                    body: `${m.homeTeam.name} ${home} - ${away} ${m.awayTeam.name}`,
+                    url: targetUrl,
+                    tag: `match-${m.id}-finished`
+                });
+                await markNotified(m.id, "finished");
+                notificationsSent++;
             }
         }
-        res.json({ ok: true, teamsChecked: teamIds.length, notificationsSent });
+
+        res.json({
+            ok: true,
+            teamsChecked: teamIds.length,
+            matchesChecked: matches.length,
+            footballDataRequests: 1,
+            notificationsSent
+        });
     } catch (err) { console.error(err.message); res.status(500).json({ ok: false, error: err.message }); }
 });
 app.get("/api/status", async (req, res) => { try { const r = await fetch(`${API_BASE}/competitions/PL`, { headers: { "X-Auth-Token": API_TOKEN } }); const json = await r.json(); res.json({ ok: r.ok, backend: "up", footballData: r.ok ? { name: json.name } : json }); } catch (err) { res.status(500).json({ ok: false, error: err.message }); } });
