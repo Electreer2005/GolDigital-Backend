@@ -124,11 +124,16 @@ app.get("/api/match/:id", async (req, res) => { try { const { data, fromCache } 
 app.get("/api/push/public-key", (req, res) => { if (!VAPID_PUBLIC_KEY) return res.status(500).json({ ok: false, error: "VAPID_PUBLIC_KEY no configurada" }); res.json({ ok: true, key: VAPID_PUBLIC_KEY }); });
 app.post("/api/push/subscribe", express.json(), async (req, res) => {
     if (!supabaseAdmin) return res.status(500).json({ ok: false, error: "Supabase no configurado en el backend" });
-    const { subscription, teamId, teamIds } = req.body || {};
+    const { subscription, teamId, teamIds, preferences = {} } = req.body || {};
     const ids = [...new Set((Array.isArray(teamIds) ? teamIds : [teamId]).filter(Boolean).map(String))];
     if (!subscription?.endpoint || !subscription.keys || ids.length === 0) return res.status(400).json({ ok: false, error: "Falta subscription o equipos" });
+    const prefs = {
+        notify_start: preferences.start !== false,
+        notify_score: preferences.score !== false,
+        notify_final: preferences.final !== false
+    };
     await supabaseAdmin.from("push_subscriptions").delete().eq("endpoint", subscription.endpoint);
-    const rows = ids.map(id => ({ endpoint: subscription.endpoint, team_id: id, p256dh: subscription.keys.p256dh, auth: subscription.keys.auth }));
+    const rows = ids.map(id => ({ endpoint: subscription.endpoint, team_id: id, p256dh: subscription.keys.p256dh, auth: subscription.keys.auth, ...prefs }));
     const { error } = await supabaseAdmin.from("push_subscriptions").insert(rows);
     if (error) return res.status(500).json({ ok: false, error: error.message });
     res.json({ ok: true, teams: ids.length });
@@ -175,6 +180,9 @@ app.get("/api/push/check", async (req, res) => {
                     .filter(s => relevantTeamIds.has(String(s.team_id)))
                     .map(s => [s.endpoint, s])
             ).values()];
+            const startSubs = matchSubs.filter(s => s.notify_start !== false);
+            const scoreSubs = matchSubs.filter(s => s.notify_score !== false);
+            const finalSubs = matchSubs.filter(s => s.notify_final !== false);
             if (matchSubs.length === 0) continue;
 
             const targetTeamId = relevantTeamIds.values().next().value;
@@ -183,7 +191,7 @@ app.get("/api/push/check", async (req, res) => {
             if (m.status === "SCHEDULED" || m.status === "TIMED") {
                 const minsUntil = (new Date(m.utcDate).getTime() - Date.now()) / 60000;
                 if (minsUntil > 0 && minsUntil <= 10 && !(await alreadyNotified(m.id, "starting"))) {
-                    await notifySubscribers(matchSubs, {
+                    await notifySubscribers(startSubs, {
                         title: "⚽ Partido en breve",
                         body: `${m.homeTeam.name} vs ${m.awayTeam.name} arranca en menos de 10 minutos`,
                         url: targetUrl,
@@ -196,7 +204,7 @@ app.get("/api/push/check", async (req, res) => {
 
             if (m.status === "IN_PLAY" || m.status === "PAUSED") {
                 if (!(await alreadyNotified(m.id, "live"))) {
-                    await notifySubscribers(matchSubs, {
+                    await notifySubscribers(startSubs, {
                         title: "🔴 ¡Arrancó!",
                         body: `${m.homeTeam.name} vs ${m.awayTeam.name} ya está en juego`,
                         url: targetUrl,
@@ -211,7 +219,7 @@ app.get("/api/push/check", async (req, res) => {
                 if (home != null && away != null) {
                     const scoreKind = `score-${home}-${away}`;
                     if (!(await alreadyNotified(m.id, scoreKind))) {
-                        await notifySubscribers(matchSubs, {
+                        await notifySubscribers(scoreSubs, {
                             title: "⚽ Cambio en el marcador",
                             body: `${m.homeTeam.name} ${home} - ${away} ${m.awayTeam.name}`,
                             url: targetUrl,
@@ -226,7 +234,7 @@ app.get("/api/push/check", async (req, res) => {
             if (m.status === "FINISHED" && !(await alreadyNotified(m.id, "finished"))) {
                 const home = m.score?.fullTime?.home ?? 0;
                 const away = m.score?.fullTime?.away ?? 0;
-                await notifySubscribers(matchSubs, {
+                await notifySubscribers(finalSubs, {
                     title: "🏁 Final del partido",
                     body: `${m.homeTeam.name} ${home} - ${away} ${m.awayTeam.name}`,
                     url: targetUrl,
