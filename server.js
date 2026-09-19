@@ -267,6 +267,28 @@ app.get("/api/predictions/leaderboard", async (req, res) => {
     } catch (err) { console.error(err.message); res.status(500).json({ ok: false, error: err.message }); }
 });
 
+app.post("/api/contact", express.json(), async (req, res) => {
+    try {
+        if (!supabaseAdmin) return res.status(500).json({ ok: false, error: "Supabase no configurado en el backend" });
+        const name = String(req.body?.name || "").trim().slice(0, 80);
+        const email = String(req.body?.email || "").trim().toLowerCase().slice(0, 160);
+        const type = String(req.body?.type || "Consulta").trim().slice(0, 40);
+        const message = String(req.body?.message || "").trim().slice(0, 3000);
+        if (name.length < 2 || !/^\S+@\S+\.\S+$/.test(email) || message.length < 10) {
+            return res.status(400).json({ ok: false, error: "Completá correctamente nombre, correo y mensaje." });
+        }
+        const allowedTypes = new Set(["Consulta", "Reportar error", "Sugerencia", "Privacidad"]);
+        const { error } = await supabaseAdmin.from("contact_messages").insert({
+            name, email, type: allowedTypes.has(type) ? type : "Consulta", message
+        });
+        if (error) throw error;
+        res.status(201).json({ ok: true });
+    } catch (err) {
+        console.error("Error de contacto:", err.message);
+        res.status(500).json({ ok: false, error: "No se pudo enviar el mensaje." });
+    }
+});
+
 app.get("/api/push/public-key", (req, res) => { if (!VAPID_PUBLIC_KEY) return res.status(500).json({ ok: false, error: "VAPID_PUBLIC_KEY no configurada" }); res.json({ ok: true, key: VAPID_PUBLIC_KEY }); });
 app.post("/api/push/subscribe", express.json(), async (req, res) => {
     if (!supabaseAdmin) return res.status(500).json({ ok: false, error: "Supabase no configurado en el backend" });
