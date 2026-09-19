@@ -168,6 +168,59 @@ app.get("/api/team/:id/overview", async (req, res) => {
 
 app.get("/api/match/:id", async (req, res) => { try { const { data, fromCache } = await fetchFootballData(`/matches/${req.params.id}`, 30000); res.json({ ok: true, cached: fromCache, normalized: normalizeMatchDetail(data), raw: data }); } catch (err) { console.error(err.message); res.status(err.status || 500).json({ ok: false, error: err.message }); } });
 
+app.post("/api/predictions/settle", express.json(), async (req, res) => {
+    try {
+        if (!supabaseAdmin) return res.status(500).json({ ok: false, error: "Supabase no configurado en el backend" });
+        const matchId = String(req.body?.matchId || "");
+        if (!matchId) return res.status(400).json({ ok: false, error: "Falta matchId" });
+
+        const { data: match } = await fetchFootballData(`/matches/${matchId}`, 30000);
+        if (match.status !== "FINISHED") return res.json({ ok: true, settled: false, reason: "MATCH_NOT_FINISHED" });
+
+        const home = match.score?.fullTime?.home;
+        const away = match.score?.fullTime?.away;
+        if (home == null || away == null) return res.json({ ok: true, settled: false, reason: "SCORE_UNAVAILABLE" });
+
+        const { data: predictions, error } = await supabaseAdmin.from("match_predictions").select("id,home_goals,away_goals").eq("match_id", matchId);
+        if (error) throw error;
+
+        let updated = 0;
+        for (const p of predictions || []) {
+            const exact = p.home_goals === home && p.away_goals === away;
+            const predictedOutcome = Math.sign(p.home_goals - p.away_goals);
+            const actualOutcome = Math.sign(home - away);
+            const points = exact ? 3 : predictedOutcome === actualOutcome ? 1 : 0;
+            const { error: updateError } = await supabaseAdmin.from("match_predictions").update({
+                points,
+                actual_home_goals: home,
+                actual_away_goals: away,
+                settled_at: new Date().toISOString()
+            }).eq("id", p.id);
+            if (updateError) throw updateError;
+            updated++;
+        }
+        res.json({ ok: true, settled: true, matchId, score: { home, away }, updated });
+    } catch (err) { console.error(err.message); res.status(err.status || 500).json({ ok: false, error: err.message }); }
+});
+
+app.get("/api/predictions/leaderboard", async (req, res) => {
+    try {
+        if (!supabaseAdmin) return res.status(500).json({ ok: false, error: "Supabase no configurado en el backend" });
+        const { data, error } = await supabaseAdmin.from("match_predictions").select("user_id,points").not("points", "is", null);
+        if (error) throw error;
+        const totals = new Map();
+        for (const row of data || []) {
+            const current = totals.get(row.user_id) || { userId: row.user_id, points: 0, predictions: 0, exact: 0 };
+            current.points += row.points || 0;
+            current.predictions++;
+            if (row.points === 3) current.exact++;
+            totals.set(row.user_id, current);
+        }
+        const ranking = [...totals.values()].sort((a,b) => b.points - a.points || b.exact - a.exact);
+        res.json({ ok: true, response: ranking });
+    } catch (err) { console.error(err.message); res.status(500).json({ ok: false, error: err.message }); }
+});
+
 app.get("/api/push/public-key", (req, res) => { if (!VAPID_PUBLIC_KEY) return res.status(500).json({ ok: false, error: "VAPID_PUBLIC_KEY no configurada" }); res.json({ ok: true, key: VAPID_PUBLIC_KEY }); });
 app.post("/api/push/subscribe", express.json(), async (req, res) => {
     if (!supabaseAdmin) return res.status(500).json({ ok: false, error: "Supabase no configurado en el backend" });
