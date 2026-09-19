@@ -223,16 +223,47 @@ app.get("/api/predictions/leaderboard", async (req, res) => {
         if (!supabaseAdmin) return res.status(500).json({ ok: false, error: "Supabase no configurado en el backend" });
         const { data, error } = await supabaseAdmin.from("match_predictions").select("user_id,points").not("points", "is", null);
         if (error) throw error;
+
         const totals = new Map();
         for (const row of data || []) {
-            const current = totals.get(row.user_id) || { userId: row.user_id, points: 0, predictions: 0, exact: 0 };
+            const current = totals.get(row.user_id) || { userId: row.user_id, points: 0, predictions: 0, exact: 0, correct: 0 };
             current.points += row.points || 0;
             current.predictions++;
             if (row.points === 3) current.exact++;
+            if ((row.points || 0) > 0) current.correct++;
             totals.set(row.user_id, current);
         }
-        const ranking = [...totals.values()].sort((a,b) => b.points - a.points || b.exact - a.exact);
-        res.json({ ok: true, response: ranking });
+
+        const users = new Map();
+        let page = 1;
+        while (page <= 10) {
+            const { data: authData, error: authError } = await supabaseAdmin.auth.admin.listUsers({ page, perPage: 100 });
+            if (authError) throw authError;
+            for (const user of authData?.users || []) users.set(user.id, user);
+            if ((authData?.users || []).length < 100) break;
+            page++;
+        }
+
+        const ranking = [...totals.values()]
+            .map(row => {
+                const user = users.get(row.userId);
+                const meta = user?.user_metadata || {};
+                return {
+                    ...row,
+                    name: meta.full_name || user?.email?.split("@")[0] || "Jugador",
+                    avatarUrl: meta.avatar_url || null,
+                    accuracy: row.predictions ? Math.round((row.correct / row.predictions) * 100) : 0
+                };
+            })
+            .sort((a,b) => b.points - a.points || b.exact - a.exact || b.accuracy - a.accuracy)
+            .map((row, index) => ({ ...row, position: index + 1 }));
+
+        res.json({
+            ok: true,
+            totalPlayers: ranking.length,
+            totalPredictions: ranking.reduce((sum, row) => sum + row.predictions, 0),
+            response: ranking
+        });
     } catch (err) { console.error(err.message); res.status(500).json({ ok: false, error: err.message }); }
 });
 
