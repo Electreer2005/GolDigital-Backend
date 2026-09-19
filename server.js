@@ -99,14 +99,30 @@ app.get("/api/results", async (req, res) => { try { const compId = getCompetitio
 app.get("/api/upcoming", async (req, res) => { try { const compId = getCompetitionId(req); const { data, fromCache } = await fetchFootballData(`/matches?competitions=${compId}&dateFrom=${todayISO()}&dateTo=${isoInDays(10)}&status=SCHEDULED`, 600000); res.json({ ok: true, cached: fromCache, response: (data.matches || []).slice(0, 6).map(normalizeMatch) }); } catch (err) { console.error(err.message); res.status(err.status || 500).json({ ok: false, error: err.message }); } });
 app.get("/api/calendar", async (req, res) => {
     try {
-        const league = String(req.query.league || "PL").toUpperCase();
-        const date = String(req.query.date || todayISO());
+        const league = String(req.query.league || "ALL").toUpperCase();
+        const date = String(req.query.date || dateKeyInTZ(new Date(), SITE_TIMEZONE));
         if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return res.status(400).json({ ok: false, error: "Fecha inválida. Usá YYYY-MM-DD." });
+
+        // La fecha de football-data.org se filtra en UTC. Para que el calendario
+        // represente el día de Argentina, pedimos un día extra a cada lado y
+        // filtramos por SITE_TIMEZONE después de recibir los partidos.
+        const selected = new Date(`${date}T12:00:00Z`);
+        const prev = new Date(selected); prev.setUTCDate(prev.getUTCDate() - 1);
+        const next = new Date(selected); next.setUTCDate(next.getUTCDate() + 1);
+        const dateFrom = prev.toISOString().slice(0, 10);
+        const dateTo = next.toISOString().slice(0, 10);
+        const competitionIds = Object.values(FREE_COMPETITIONS).map(item => item.id).join(",");
         const path = league === "ALL"
-            ? `/matches?dateFrom=${date}&dateTo=${date}`
-            : `/matches?competitions=${getCompetitionId(req)}&dateFrom=${date}&dateTo=${date}`;
+            ? `/matches?competitions=${competitionIds}&dateFrom=${dateFrom}&dateTo=${dateTo}`
+            : `/matches?competitions=${getCompetitionId(req)}&dateFrom=${dateFrom}&dateTo=${dateTo}`;
+
         const { data, fromCache } = await fetchFootballData(path, 120000);
-        res.json({ ok: true, cached: fromCache, date, response: (data.matches || []).map(normalizeMatch) });
+        const matches = (data.matches || [])
+            .filter(m => dateKeyInTZ(new Date(m.utcDate), SITE_TIMEZONE) === date)
+            .sort((a, b) => new Date(a.utcDate) - new Date(b.utcDate))
+            .map(normalizeMatch);
+
+        res.json({ ok: true, cached: fromCache, date, timezone: SITE_TIMEZONE, count: matches.length, response: matches });
     } catch (err) { console.error(err.message); res.status(err.status || 500).json({ ok: false, error: err.message }); }
 });
 app.get("/api/standings", async (req, res) => { try { const compId = getCompetitionId(req); const { data, fromCache } = await fetchFootballData(`/competitions/${compId}/standings`, 900000); const groups = (data.standings || []).filter(s => s.type === "TOTAL"); const mapRow = row => ({ position: row.position, team: { name: row.team.name, crest: row.team.crest }, played: row.playedGames, won: row.won, draw: row.draw, lost: row.lost, goalDifference: row.goalDifference, points: row.points }); const table = groups.length === 1 ? groups[0].table.map(mapRow) : null; const byGroup = groups.length > 1 ? groups.map(g => ({ group: g.group, table: g.table.map(mapRow) })) : null; res.json({ ok: true, cached: fromCache, response: table, byGroup }); } catch (err) { console.error(err.message); res.status(err.status || 500).json({ ok: false, error: err.message }); } });
