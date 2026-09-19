@@ -111,18 +111,33 @@ app.get("/api/calendar", async (req, res) => {
         const next = new Date(selected); next.setUTCDate(next.getUTCDate() + 1);
         const dateFrom = prev.toISOString().slice(0, 10);
         const dateTo = next.toISOString().slice(0, 10);
-        const competitionIds = Object.values(FREE_COMPETITIONS).map(item => item.id).join(",");
+        // Para "ALL" usamos el endpoint global de partidos. football-data.org no
+        // garantiza que una lista CSV de competitions funcione de forma consistente
+        // en /matches y puede devolver 0 aunque haya partidos. Después filtramos
+        // localmente a las competiciones que GolDigital soporta.
+        const supportedCompetitionIds = new Set(Object.values(FREE_COMPETITIONS).map(item => Number(item.id)));
         const path = league === "ALL"
-            ? `/matches?competitions=${competitionIds}&dateFrom=${dateFrom}&dateTo=${dateTo}`
+            ? `/matches?dateFrom=${dateFrom}&dateTo=${dateTo}`
             : `/matches?competitions=${getCompetitionId(req)}&dateFrom=${dateFrom}&dateTo=${dateTo}`;
 
         const { data, fromCache } = await fetchFootballData(path, 120000);
-        const matches = (data.matches || [])
+        const received = data.matches || [];
+        const matches = received
+            .filter(m => league !== "ALL" || supportedCompetitionIds.has(Number(m.competition?.id)))
             .filter(m => dateKeyInTZ(new Date(m.utcDate), SITE_TIMEZONE) === date)
             .sort((a, b) => new Date(a.utcDate) - new Date(b.utcDate))
             .map(normalizeMatch);
 
-        res.json({ ok: true, cached: fromCache, date, timezone: SITE_TIMEZONE, count: matches.length, response: matches });
+        res.json({
+            ok: true,
+            cached: fromCache,
+            date,
+            league,
+            timezone: SITE_TIMEZONE,
+            count: matches.length,
+            received: received.length,
+            response: matches
+        });
     } catch (err) { console.error(err.message); res.status(err.status || 500).json({ ok: false, error: err.message }); }
 });
 app.get("/api/standings", async (req, res) => { try { const compId = getCompetitionId(req); const { data, fromCache } = await fetchFootballData(`/competitions/${compId}/standings`, 900000); const groups = (data.standings || []).filter(s => s.type === "TOTAL"); const mapRow = row => ({ position: row.position, team: { name: row.team.name, crest: row.team.crest }, played: row.playedGames, won: row.won, draw: row.draw, lost: row.lost, goalDifference: row.goalDifference, points: row.points }); const table = groups.length === 1 ? groups[0].table.map(mapRow) : null; const byGroup = groups.length > 1 ? groups.map(g => ({ group: g.group, table: g.table.map(mapRow) })) : null; res.json({ ok: true, cached: fromCache, response: table, byGroup }); } catch (err) { console.error(err.message); res.status(err.status || 500).json({ ok: false, error: err.message }); } });
