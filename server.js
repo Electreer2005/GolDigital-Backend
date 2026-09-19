@@ -118,16 +118,35 @@ app.get("/api/team/:id/overview", async (req, res) => {
         const [teamRes, liveRes, lastRes, nextRes] = await Promise.all([
             fetchFootballData(`/teams/${teamId}`, 3600000),
             fetchFootballData(`/teams/${teamId}/matches?status=LIVE`, 60000),
-            fetchFootballData(`/teams/${teamId}/matches?status=FINISHED&dateFrom=${isoDaysAgo(45)}&dateTo=${todayISO()}`, 600000),
-            fetchFootballData(`/teams/${teamId}/matches?status=SCHEDULED&dateFrom=${todayISO()}&dateTo=${isoInDays(45)}`, 600000)
+            fetchFootballData(`/teams/${teamId}/matches?status=FINISHED&dateFrom=${isoDaysAgo(90)}&dateTo=${todayISO()}`, 600000),
+            fetchFootballData(`/teams/${teamId}/matches?status=SCHEDULED&dateFrom=${todayISO()}&dateTo=${isoInDays(90)}`, 600000)
         ]);
         const team = teamRes.data;
         const finished = lastRes.data.matches || [];
         const scheduled = nextRes.data.matches || [];
         const live = (liveRes.data.matches || []).map(normalizeMatch);
-        const last = finished.length ? normalizeMatch(finished[finished.length - 1]) : null;
-        const next = scheduled.length ? normalizeMatch(scheduled[0]) : null;
-        res.json({ ok: true, response: { team: { id: team.id, name: team.name, shortName: team.shortName, tla: team.tla, crest: team.crest, website: team.website, founded: team.founded, venue: team.venue }, live, last, next } });
+        const recent = finished.slice(-5).reverse().map(normalizeMatch);
+        const upcoming = scheduled.slice(0, 5).map(normalizeMatch);
+        const competitionsMap = new Map();
+        [...finished, ...scheduled, ...(liveRes.data.matches || [])].forEach(m => {
+            if (m.competition?.id) competitionsMap.set(String(m.competition.id), {
+                id: m.competition.id, code: m.competition.code || '', name: m.competition.name || ''
+            });
+        });
+        res.json({ ok: true, response: {
+            team: {
+                id: team.id, name: team.name, shortName: team.shortName, tla: team.tla,
+                crest: team.crest, website: team.website, founded: team.founded,
+                venue: team.venue, clubColors: team.clubColors,
+                address: team.address, coach: team.coach?.name || null
+            },
+            live,
+            last: recent[0] || null,
+            next: upcoming[0] || null,
+            recent,
+            upcoming,
+            competitions: [...competitionsMap.values()]
+        } });
     } catch (err) { console.error(err.message); res.status(err.status || 500).json({ ok: false, error: err.message }); }
 });
 
